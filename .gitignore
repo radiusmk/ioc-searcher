@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Resultados
+ioc_results.json
+*.json
+!package.json
+
+# Arquivos de teste (não commitar arquivos de ransomware reais)
+test_files/
+ransomware_files/
+*.log
+*.txt
+!requirements.txt
+!README.md
+
+# OS
+.DS_Store
+Thumbs.db
+
