@@ -74,8 +74,8 @@ O script mostra em tempo real o arquivo sendo processado na mesma linha (sem cri
 **Exemplo de saída:**
 ```
 [*] Total de arquivos a processar: 10753
-1 de 10753: BACEN\evidencias\CMSW\Design\OldDesign\Projects\C&M Software\Design\Festas\Placas\Placas Comemorativas\Logos\SPB\Morada\SPB
-2 de 10753: BACEN\evidencias\CMSW\Design\OldDesign\Projects\C&M Software\Design\Festas\Placas\Placas Comemorativas\Logos\SPB\Pecúnia\SPB
+1 de 10753: teste\arquivo.txt
+2 de 10753: teste\arquivo2.txt
 ```
 
 - **Formato**: `X de Y: caminho/completo/do/arquivo`
