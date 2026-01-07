@@ -13,6 +13,10 @@ from collections import defaultdict
 from typing import List, Dict, Set, Tuple
 import re
 import time
+import signal
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 try:
     from colorama import init, AnsiToWin32
@@ -24,18 +28,40 @@ except ImportError:
 from ioc_detectors import IOCDetector
 from file_processor import FileProcessor
 
+# Flag global para controlar interrupção
+shutdown_event = threading.Event()
+
+def signal_handler(signum, frame):
+    """Handler para sinais de interrupção."""
+    global shutdown_event
+    print("\n[!] Recebido sinal de interrupção. Encerrando graciosamente...", flush=True)
+    shutdown_event.set()
+
+# Configura o handler de sinal
+signal.signal(signal.SIGINT, signal_handler)
+
+def check_shutdown():
+    """Verifica se foi solicitado shutdown e lança KeyboardInterrupt se necessário."""
+    if shutdown_event.is_set():
+        raise KeyboardInterrupt("Shutdown solicitado")
+
 
 class IOCSearcher:
     """Classe principal para realizar buscas de IOCs em arquivos."""
-    
-    def __init__(self, target_directory: str):
+
+    def __init__(self, target_directory: str, max_workers: int = 4):
         self.target_directory = Path(target_directory)
         if not self.target_directory.exists():
             raise ValueError(f"Diretório não encontrado: {target_directory}")
-        
+
         self.detector = IOCDetector()
         self.processor = FileProcessor()
         self.results = defaultdict(lambda: defaultdict(set))
+        self.results_lock = threading.Lock()  # Lock para acesso thread-safe aos resultados
+        self.max_workers = max_workers
+
+        # Passa a função de verificação de shutdown para o processor
+        self.processor.set_shutdown_checker(check_shutdown)
         
     def search(self) -> Dict:
         """Realiza a busca de IOCs em todos os arquivos do diretório."""
@@ -127,54 +153,152 @@ class IOCSearcher:
                 except:
                     pass
 
-        # Processa os arquivos
-        last_displayed_file = None
+        # Processa os arquivos usando múltiplas threads
+        processed_count = 0
+        file_count = 0
+        total_matches = 0
+        thread_id_counter = 0
 
-        for file_path in all_files:
-            processed_count += 1
+        # Estruturas thread-safe
+        progress_lock = threading.Lock()
+        thread_status_lock = threading.Lock()
+        output_lock = threading.Lock()
 
-            # Exibe apenas o arquivo sendo processado na mesma linha
+        def get_thread_id():
+            """Atribui um ID único para cada thread."""
+            with thread_status_lock:
+                nonlocal thread_id_counter
+                thread_id_counter += 1
+                return thread_id_counter
+
+        def show_progress():
+            """Mostra o progresso atual."""
+            with thread_status_lock:
+                progress_msg = f"[*] Progresso: {processed_count}/{total_files} arquivos processados"
+                with output_lock:
+                    print(progress_msg, flush=True)
+
+        def process_file_threaded(file_path):
+            """Processa um arquivo em uma thread separada."""
+            nonlocal processed_count, file_count, total_matches
+
+            thread_id = get_thread_id()
+
+            # Verifica se foi solicitado encerramento antes de começar
+            if shutdown_event.is_set():
+                with thread_status_lock:
+                    processed_count += 1
+                return False
+
+            # Mostra que a thread começou o processamento
+            relative_path = str(file_path).replace(str(self.target_directory), '').lstrip(os.sep)
+            with output_lock:
+                print(f"[Thread {thread_id}] Iniciando processamento: {relative_path}", flush=True)
+
             try:
-                relative_path = file_path.relative_to(self.target_directory)
-            except ValueError:
-                # Se não conseguir fazer relative, usa o caminho completo
-                relative_path = str(file_path)
+                # Verifica novamente se foi solicitado encerramento
+                if shutdown_event.is_set():
+                    with thread_status_lock:
+                        processed_count += 1
+                    with output_lock:
+                        print(f"[Thread {thread_id}] Iniciando processamento: {relative_path} (Interrompido).", flush=True)
+                    show_progress()
+                    return False
 
-            # Mostra progresso e arquivo atual na mesma linha
-            status_msg = f"{processed_count} de {total_files}: {relative_path}"
-
-            # Atualiza a exibição na mesma linha usando colorama para compatibilidade Windows
-            if COLORAMA_AVAILABLE:
-                # Usa sequências ANSI com colorama para Windows
-                if last_displayed_file is not None:
-                    # Move cursor para cima e limpa a linha
-                    print(colorama.ansi.clear_line(), end='')
-                    print(colorama.Cursor.UP(1), end='')
-                print(status_msg, end='\r')
-            else:
-                # Fallback sem colorama - mostra em linhas separadas
-                print(status_msg)
-
-            last_displayed_file = status_msg
-
-            try:
                 matches = self._process_file(file_path)
-                if matches:
-                    file_count += 1
-                    total_matches += sum(len(v) for v in matches.values())
-                    self._update_results(str(file_path), matches)
-            except Exception as e:
-                # Limpa a linha atual e mostra o erro em nova linha
-                sys.stdout.write(f"\r{' ' * len(status_msg)}\r")
-                sys.stdout.flush()
-                print(f"[!] Erro ao processar {file_path}: {e}")
 
-        # Limpa a linha final de status
-        if COLORAMA_AVAILABLE:
-            print(colorama.ansi.clear_line(), end='')
-        else:
-            # Fallback - apenas adiciona uma linha em branco
-            print()
+                # Verifica uma última vez após processamento
+                if shutdown_event.is_set():
+                    with thread_status_lock:
+                        processed_count += 1
+                    with output_lock:
+                        print(f"[Thread {thread_id}] Iniciando processamento: {relative_path} (Interrompido).", flush=True)
+                    show_progress()
+                    return False
+
+                success = bool(matches)
+
+                # Atualiza contadores de forma thread-safe
+                with thread_status_lock:
+                    if success:
+                        file_count += 1
+                        total_matches += sum(len(v) for v in matches.values())
+                    processed_count += 1
+
+                if success:
+                    # Atualiza resultados de forma thread-safe
+                    with self.results_lock:
+                        self._update_results(str(file_path), matches)
+
+                # Mostra que a thread terminou o processamento
+                if success:
+                    with output_lock:
+                        print(f"[Thread {thread_id}] Iniciando processamento: {relative_path} (Concluído).", flush=True)
+                show_progress()
+                return success
+
+            except Exception as e:
+                # Atualiza status e mostra erro
+                with thread_status_lock:
+                    processed_count += 1
+                with output_lock:
+                    print(f"[Thread {thread_id}] Iniciando processamento: {relative_path} (Erro).", flush=True)
+                    print(f"[!] Erro na Thread {thread_id} ao processar {relative_path}: {e}", flush=True)
+                show_progress()
+                return False
+
+        # Executa processamento multi-thread
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submete todos os arquivos para processamento
+            future_to_file = {executor.submit(process_file_threaded, file_path): file_path
+                            for file_path in all_files}
+
+            # Aguarda conclusão de todas as tarefas com verificação de interrupção
+            try:
+                # Processa tarefas com verificação periódica de interrupção
+                remaining_futures = set(future_to_file.keys())
+                while remaining_futures and not shutdown_event.is_set():
+                    # Usa timeout para permitir verificação de interrupção
+                    try:
+                        completed, remaining_futures = concurrent.futures.wait(
+                            remaining_futures, timeout=0.1,
+                            return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+
+                        # Processa tarefas concluídas
+                        for future in completed:
+                            try:
+                                future.result()  # Levanta exceções se houver
+                            except Exception as e:
+                                # Erro já foi tratado na função process_file_threaded
+                                pass
+
+                            # Atualiza progresso após cada tarefa concluída
+                            show_progress()
+
+                    except concurrent.futures.TimeoutError:
+                        # Timeout normal, continua verificando
+                        continue
+
+                # Se foi interrompido, cancela tarefas restantes
+                if shutdown_event.is_set():
+                    print("\n[!] Interrupção solicitada. Cancelando tarefas restantes...", flush=True)
+                    for future in remaining_futures:
+                        future.cancel()
+
+            except KeyboardInterrupt:
+                print("\n[!] KeyboardInterrupt detectado. Encerrando...", flush=True)
+                shutdown_event.set()
+                # Cancela tarefas pendentes
+                for future in future_to_file:
+                    if not future.done():
+                        future.cancel()
+
+        # Mostra progresso final
+        with progress_lock:
+            if COLORAMA_AVAILABLE:
+                print(colorama.ansi.clear_line(), end='')
+            print(f"[*] Processamento concluído: {processed_count}/{total_files} arquivos")
 
         print(f"[*] Processamento concluído!")
         print(f"[*] Arquivos processados: {file_count} (de {processed_count} analisados)")
@@ -240,33 +364,40 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos de uso:
-  python ioc_searcher.py ./ransomware_files
-  python ioc_searcher.py ./ransomware_files --output results.json
-  python ioc_searcher.py ./ransomware_files --json-only
+  python ioc_searcher.py /caminho/para/analisar
+  python ioc_searcher.py /dados/ransomware --output relatorio.json --threads 8
+  python ioc_searcher.py /logs/suspeitos --json-only --threads 2
         """
     )
-    
+
     parser.add_argument(
         'directory',
         help='Diretório contendo os arquivos para análise'
     )
-    
+
     parser.add_argument(
         '--output', '-o',
         default=None,
         help='Arquivo JSON para exportar os resultados'
     )
-    
+
     parser.add_argument(
         '--json-only',
         action='store_true',
         help='Apenas exporta para JSON, sem imprimir resultados no console'
     )
+
+    parser.add_argument(
+        '--threads', '-t',
+        type=int,
+        default=4,
+        help='Número de threads para processamento paralelo (padrão: 4)'
+    )
     
     args = parser.parse_args()
     
     try:
-        searcher = IOCSearcher(args.directory)
+        searcher = IOCSearcher(args.directory, max_workers=args.threads)
         results = searcher.search()
         
         if not args.json_only:
@@ -282,7 +413,8 @@ Exemplos de uso:
         print(f"[!] Erro: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n[!] Interrompido pelo usuário", file=sys.stderr)
+        print("\n[!] Interrompido pelo usuário (Ctrl+C)", file=sys.stderr)
+        print("[*] Saindo graciosamente...", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"[!] Erro inesperado: {e}", file=sys.stderr)
