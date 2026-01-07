@@ -16,9 +16,14 @@ except ImportError:
 
 class FileProcessor:
     """Classe para processar e ler diferentes tipos de arquivos."""
-    
+
     def __init__(self, max_file_size: int = 50 * 1024 * 1024):  # 50MB padrão
         self.max_file_size = max_file_size
+        self.shutdown_checker = None
+
+    def set_shutdown_checker(self, checker_func):
+        """Define a função para verificar shutdown."""
+        self.shutdown_checker = checker_func
     
     def read_file(self, file_path: Path) -> Optional[str]:
         """
@@ -26,17 +31,25 @@ class FileProcessor:
         Tenta detectar a codificação automaticamente.
         """
         try:
+            # Verifica shutdown antes de começar
+            if self.shutdown_checker:
+                self.shutdown_checker()
+
             # Verifica tamanho do arquivo
             file_size = file_path.stat().st_size
             if file_size > self.max_file_size:
                 # Para arquivos muito grandes, lê apenas uma amostra
                 return self._read_large_file_sample(file_path)
-            
+
             # Tenta ler com diferentes codificações
             encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'ascii']
-            
+
             for encoding in encodings:
                 try:
+                    # Verifica shutdown antes de tentar cada codificação
+                    if self.shutdown_checker:
+                        self.shutdown_checker()
+
                     with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
                         content = f.read()
                         # Verifica se parece ser texto (não binário)
@@ -44,12 +57,15 @@ class FileProcessor:
                             return content
                 except (UnicodeDecodeError, UnicodeError):
                     continue
-            
+
             # Se nenhuma codificação funcionou, tenta detectar automaticamente
             return self._read_with_detection(file_path)
-            
+
         except PermissionError:
             return None
+        except KeyboardInterrupt:
+            # Re-levanta KeyboardInterrupt para sinalizar interrupção
+            raise
         except Exception as e:
             return None
     
@@ -58,16 +74,24 @@ class FileProcessor:
         Lê uma amostra de um arquivo grande (primeiros N bytes).
         """
         try:
+            # Verifica shutdown antes de começar
+            if self.shutdown_checker:
+                self.shutdown_checker()
+
             with open(file_path, 'rb') as f:
                 sample = f.read(sample_size)
-            
+
+            # Verifica shutdown após leitura
+            if self.shutdown_checker:
+                self.shutdown_checker()
+
             # Detecta codificação
             if HAS_CHARDET:
                 detected = chardet.detect(sample)
                 encoding = detected.get('encoding', 'utf-8')
             else:
                 encoding = 'utf-8'
-            
+
             if encoding:
                 try:
                     content = sample.decode(encoding, errors='ignore')
@@ -75,7 +99,7 @@ class FileProcessor:
                         return content
                 except:
                     pass
-            
+
             # Fallback para latin-1
             try:
                 content = sample.decode('latin-1', errors='ignore')
@@ -83,9 +107,11 @@ class FileProcessor:
                     return content
             except:
                 pass
-            
+
             return None
-            
+
+        except KeyboardInterrupt:
+            raise
         except Exception:
             return None
     
@@ -94,28 +120,38 @@ class FileProcessor:
         Lê arquivo detectando a codificação automaticamente.
         """
         try:
+            # Verifica shutdown antes de começar
+            if self.shutdown_checker:
+                self.shutdown_checker()
+
             with open(file_path, 'rb') as f:
                 raw_data = f.read(min(1024 * 1024, self.max_file_size))  # Lê até 1MB para detecção
-            
+
+            # Verifica shutdown após leitura inicial
+            if self.shutdown_checker:
+                self.shutdown_checker()
+
             if HAS_CHARDET:
                 detected = chardet.detect(raw_data)
                 encoding = detected.get('encoding', 'utf-8')
                 confidence = detected.get('confidence', 0)
-                
+
                 # Se a confiança for muito baixa, tenta utf-8
                 if confidence < 0.5:
                     encoding = 'utf-8'
             else:
                 encoding = 'utf-8'
-            
+
             # Lê o arquivo completo com a codificação detectada
             with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
                 content = f.read(self.max_file_size)
                 if self._is_text_content(content):
                     return content
-            
+
             return None
-            
+
+        except KeyboardInterrupt:
+            raise
         except Exception:
             return None
     
